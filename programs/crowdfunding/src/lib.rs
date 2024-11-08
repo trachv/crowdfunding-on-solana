@@ -7,6 +7,13 @@ const MAX_DESCRIPTION_LENGTH: usize = 500;
 const MIN_CAMPAIGN_DURATION: i64 = 3600;
 const MAX_CAMPAIGN_DURATION: i64 = 86400 * 30;
 
+// Fee Constants
+const BASE_FEE_RATE_NUMERATOR: u64 = 200; // 2%
+const BASE_FEE_RATE_DENOMINATOR: u64 = 10_000;
+
+const VARIABLE_FEE_RATE_NUMERATOR: u64 = 50; // 0.5%
+const VARIABLE_FEE_RATE_DENOMINATOR: u64 = 10_000;
+
 #[program]
 pub mod crowdfunding {
     use super::*;
@@ -47,33 +54,64 @@ pub mod crowdfunding {
     }
 
     pub fn donate(ctx: Context<Donate>, amount: u64) -> Result<()> {
-    let admin = &ctx.accounts.admin;
-    require!(!admin.paused, ErrorCode::ContractPaused);
+        let admin = &ctx.accounts.admin;
+        require!(!admin.paused, ErrorCode::ContractPaused);
 
-    let clock = Clock::get()?;
+        let clock = Clock::get()?;
 
-    require!(
-        clock.unix_timestamp < ctx.accounts.campaign.deadline,
-        ErrorCode::CampaignEnded
-    );
+        require!(
+            clock.unix_timestamp < ctx.accounts.campaign.deadline,
+            ErrorCode::CampaignEnded
+        );
 
-    let transfer_ix = anchor_lang::system_program::Transfer {
-        from: ctx.accounts.donor.to_account_info(),
-        to: ctx.accounts.campaign.to_account_info(),
-    };
-    let transfer_ctx =
-        CpiContext::new(ctx.accounts.system_program.to_account_info(), transfer_ix);
-    anchor_lang::system_program::transfer(transfer_ctx, amount)?;
+        // Calculate Fee
+        let fee = compute_fee(amount, &ctx.accounts.campaign)?;
 
-    let campaign = &mut ctx.accounts.campaign;
+        // Ensure the donation covers the Fee
+        require!(amount > fee, ErrorCode::InvalidDonationAmount);
 
-    campaign.raised_amount = campaign
-        .raised_amount
-        .checked_add(amount)
-        .ok_or(ErrorCode::MathOverflow)?;
+        let net_amount = amount
+            .checked_sub(fee)
+            .ok_or(ErrorCode::MathOverflow)?;
 
-    Ok(())
-}
+        // Transfer Fee to admin
+        let transfer_fee_ix = anchor_lang::system_program::Transfer {
+            from: ctx.accounts.donor.to_account_info(),
+            to: ctx.accounts.admin.to_account_info(),
+        };
+        let transfer_fee_ctx = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            transfer_fee_ix,
+        );
+        anchor_lang::system_program::transfer(
+            transfer_fee_ctx,
+            fee,
+        )?;
+
+        // Transfer net amount to campaign
+        let transfer_net_ix = anchor_lang::system_program::Transfer {
+            from: ctx.accounts.donor.to_account_info(),
+            to: ctx.accounts.campaign.to_account_info(),
+        };
+        let transfer_net_ctx = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            transfer_net_ix,
+        );
+        anchor_lang::system_program::transfer(
+            transfer_net_ctx,
+            net_amount,
+        )?;
+
+        // Update campaign's raised amount
+        let campaign = &mut ctx.accounts.campaign;
+
+        campaign.raised_amount = campaign
+            .raised_amount
+            .checked_add(net_amount)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        Ok(())
+    }
 
     pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
         let admin = &ctx.accounts.admin;
@@ -237,4 +275,48 @@ pub enum ErrorCode {
     CampaignTooLong,
     #[msg("The contract is paused.")]
     ContractPaused,
+    #[msg("Invalid donation amount after fee.")]
+    InvalidDonationAmount,
+}
+
+/// Computes the fee based on the donation amount and campaign state.
+/// Fee = Base Fee + Variable Fee
+/// Base Fee = amount * BASE_FEE_RATE_NUMERATOR / BASE_FEE_RATE_DENOMINATOR
+/// Variable Fee = (raised_amount / goal) * amount * VARIABLE_FEE_RATE_NUMERATOR / VARIABLE_FEE_RATE_DENOMINATOR
+fn compute_fee(amount: u64, campaign: &Campaign) -> Result<u64> {
+    // Calculate Base Fee
+    let base_fee = amount
+        .checked_mul(BASE_FEE_RATE_NUMERATOR)
+        .ok_or(ErrorCode::MathOverflow)?
+        .checked_div(BASE_FEE_RATE_DENOMINATOR)
+        .ok_or(ErrorCode::MathOverflow)?;
+
+    // Calculate the ratio of raised_amount to goal
+    let ratio = if campaign.goal == 0 {
+        0
+    } else {
+        campaign.raised_amount
+            .checked_mul(10_000)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(campaign.goal)
+            .ok_or(ErrorCode::MathOverflow)?
+    };
+
+    // Calculate Variable Fee based on the ratio
+    let variable_fee = amount
+        .checked_mul(VARIABLE_FEE_RATE_NUMERATOR)
+        .ok_or(ErrorCode::MathOverflow)?
+        .checked_div(VARIABLE_FEE_RATE_DENOMINATOR)
+        .ok_or(ErrorCode::MathOverflow)?
+        .checked_mul(ratio)
+        .ok_or(ErrorCode::MathOverflow)?
+        .checked_div(10_000)
+        .ok_or(ErrorCode::MathOverflow)?;
+
+    // Total Fee
+    let total_fee = base_fee
+        .checked_add(variable_fee)
+        .ok_or(ErrorCode::MathOverflow)?;
+
+    Ok(total_fee)
 }
